@@ -171,6 +171,14 @@ describe("node:http", () => {
   });
 
   describe("request", () => {
+    class Collector extends Writable {
+      public bufferedBytes: Uint8Array[] = [];
+
+      _write(chunk: Uint8Array, encoding: string, callback: () => void) {
+        this.bufferedBytes.push(chunk);
+        callback();
+      }
+    }
     function runTest(done: Function, callback: (server: Server, port: number, done: (err?: Error) => void) => void) {
       let timer;
       const server = createServer((req, res) => {
@@ -794,16 +802,130 @@ describe("node:http", () => {
     });
 
     it("should emit a socket event when connecting", async done => {
-      runTest(done, async (server, serverPort, done) => {
-        const req = request(`http://localhost:${serverPort}`, {});
-        await new Promise((resolve, reject) => {
-          req.on("error", reject);
-          req.on("socket", function onRequestSocket(socket) {
-            req.destroy();
-            done();
-            resolve();
-          });
-        });
+        runTest(done, async (server, serverPort, done) => {
+            const req = request(`http://localhost:${serverPort}`, {});
+            await new Promise((resolve, reject) => {
+                req.on("error", reject);
+                req.on("socket", function onRequestSocket(socket) {
+                    req.destroy();
+                    done();
+                    resolve();
+                });
+            });
+        })
+    });
+
+    it(`should allow piping multiple chunks to collector stream`, done => {
+      const chunkSize = 1024 * 16; // 16 kb
+      const testData = Buffer.from(Array(chunkSize * 5).fill("a"));
+
+      const createStream = () =>
+        new Response(
+          new ReadableStream({
+            async start(controller) {
+              const chunksNum = Math.ceil(testData.length / chunkSize);
+
+              for (let i = 0; i < chunksNum; i++) {
+                const start = i * chunkSize;
+                controller.enqueue(testData.subarray(start, start + chunkSize));
+              }
+
+              controller.close();
+            },
+          }),
+          {
+            headers: {
+              "content-length": testData.length.toString(),
+            },
+          },
+        );
+
+      const collector = new Collector();
+      const response = new IncomingMessage(createStream(), { type: "response" });
+      response.pipe(collector);
+      response.on("error", err => {
+        collector.end();
+        done(err);
+      });
+      collector.on("error", done);
+      collector.on("finish", () => {
+        const result = Buffer.concat(collector.bufferedBytes).toString("utf8");
+
+        expect(result).toBeDefined();
+        expect(result.length).toEqual(chunkSize * 5);
+        done();
+      });
+    });
+    it(`should allow piping single chunk to collector stream`, done => {
+      const chunkSize = 1000 * 16; // 16 kb
+      const testData = Buffer.from(Array(chunkSize * 1).fill("a"));
+
+      const createStream = () =>
+        new Response(
+          new ReadableStream({
+            async start(controller) {
+              const chunksNum = Math.ceil(testData.length / chunkSize);
+
+              for (let i = 0; i < chunksNum; i++) {
+                const start = i * chunkSize;
+                controller.enqueue(testData.subarray(start, start + chunkSize));
+              }
+
+              controller.close();
+            },
+          }),
+          {
+            headers: {
+              "content-length": testData.length.toString(),
+            },
+          },
+        );
+
+      const collector = new Collector();
+      const response = new IncomingMessage(createStream(), { type: "response" });
+      response.pipe(collector);
+      response.on("error", err => {
+        collector.end();
+        done(err);
+      });
+      collector.on("error", done);
+      collector.on("finish", () => {
+        const result = Buffer.concat(collector.bufferedBytes).toString("utf8");
+
+        expect(result).toBeDefined();
+        expect(result.length).toEqual(chunkSize * 1);
+        done();
+      });
+    });
+    it(`should allow piping no chunks to collector stream`, done => {
+      const createStream = () =>
+        new Response(
+          new ReadableStream({
+            async start(controller) {
+              controller.close();
+            },
+          }),
+          {
+            headers: {
+              "content-length": "0",
+            },
+          },
+        );
+
+      const collector = new Collector();
+      const response = new IncomingMessage(createStream(), { type: "response" });
+      response.pipe(collector);
+      response.on("error", err => {
+        collector.end();
+        done(err);
+      });
+      collector.on("error", done);
+      collector.on("finish", () => {
+        const result = Buffer.concat(collector.bufferedBytes).toString("utf8");
+
+        expect(result).toBeDefined();
+        expect(result.length).toEqual(0);
+        done();
       });
     });
   });
@@ -1664,61 +1786,6 @@ it("IncomingMessage with a RequestLike object", () => {
     "header-63",
     "value-63",
   ]);
-});
-
-describe("IncomingMessage", () => {
-  class Collector extends Writable {
-    public bufferedBytes: Uint8Array[] = [];
-
-    _write(chunk: Uint8Array, encoding: string, callback: () => void) {
-      this.bufferedBytes.push(chunk);
-      callback();
-    }
-  }
-
-  const chunkSize = 1024 * 16; // 16 kb
-  const bigData = Buffer.from(Array(chunkSize * 5).fill("a"));
-
-  const createStream = () =>
-    new Response(
-      new ReadableStream({
-        async start(controller) {
-          const chunksNum = Math.ceil(bigData.length / chunkSize);
-
-          for (let i = 0; i < chunksNum; i++) {
-            const start = i * chunkSize;
-            controller.enqueue(bigData.subarray(start, start + chunkSize));
-          }
-
-          controller.close();
-        },
-      }),
-      {
-        headers: {
-          "content-length": bigData.length.toString(),
-        },
-      },
-    );
-
-  it(`.pipe()`, async () => {
-    const data = await new Promise<string>((resolve, reject) => {
-      const collector = new Collector();
-      const response = new IncomingMessage(createStream());
-      response.pipe(collector);
-      response.on("error", err => {
-        collector.end();
-        reject(err);
-      });
-      collector.on("error", reject);
-      collector.on("finish", () => {
-        const result = Buffer.concat(collector.bufferedBytes).toString("utf8");
-        resolve(result);
-      });
-    });
-
-    expect(data).toBeDefined();
-    expect(data.length).toEqual(chunkSize * 5);
-  });
 });
 
 it("#6892", () => {
